@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Opera Game, in isometric</title>
+<style>
+:root{--fog:#dfe7ea;--ink:#1b2830;--ink2:#26363f;--paper:#eef3f2;--mute:#9db1b8;--amber:#f2b01e;--rasp:#d6336c;
+  --serif:Charter,'Bitstream Charter','Iowan Old Style','Palatino Linotype',Georgia,serif;
+  --sans:'Segoe UI','Helvetica Neue',Arial,'FreeSans',sans-serif}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--fog);color:var(--paper);font-family:var(--sans);display:grid;grid-template-columns:1fr 400px}
+.stage{display:flex;align-items:center;justify-content:center;padding:12px;min-width:0;min-height:0}
+.stage svg{max-height:100vh;display:block}
+aside{background:var(--ink);padding:30px 28px 22px;display:flex;flex-direction:column;gap:16px;min-height:0;overflow:hidden}
+h1{font:600 34px/1.05 var(--serif);margin:0;letter-spacing:-.01em}
+.sub{margin:0;color:var(--mute);font-size:13.5px;line-height:1.5}
+.now{border-top:1px solid #3a4d58;padding-top:16px}
+.san{font:600 30px/1 var(--serif);display:flex;align-items:baseline;gap:10px}
+.san small{font:500 12.5px var(--sans);color:var(--mute)}
+.note{margin:12px 0 0;font:17px/1.5 var(--serif);min-height:7.5em}
+.moves{display:grid;grid-template-columns:26px 1fr 1fr 26px 1fr 1fr;gap:2px 6px;font-size:13.5px;overflow:auto;align-content:start;flex:1;min-height:0;padding-right:4px}
+.moves span{padding:2px 5px;border-radius:4px;cursor:pointer;color:#c5d3d8}
+.moves .n{color:var(--mute);cursor:default;padding-left:0}
+.moves .on{background:var(--amber);color:#1b1b1b;font-weight:600}
+.moves .seen{color:#fff}
+.ctl{display:flex;align-items:center;gap:10px}
+.ctl button{background:var(--ink2);color:var(--paper);border:1px solid #3a4d58;border-radius:8px;height:36px;min-width:40px;font-size:15px;cursor:pointer}
+.ctl button:hover{border-color:var(--amber)}
+.ctl input{flex:1;accent-color:var(--amber)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.video .ctl{display:none}
+.video aside{padding-bottom:30px}
+@media (max-width:900px){body{grid-template-columns:1fr;grid-template-rows:auto 1fr;height:auto}aside{min-height:60vh}.stage svg{max-height:55vh}}
+</style>
+</head>
+<body>
+<div class="stage" id="stage"></div>
+<aside>
+  <div><h1 id="title"></h1><p class="sub" id="sub"></p></div>
+  <div class="now"><div class="san" id="san"></div><p class="note" id="note"></p></div>
+  <div class="moves" id="moves" aria-label="Move list"></div>
+  <div class="ctl">
+    <button id="prev" aria-label="Previous move">&#9664;</button>
+    <button id="play" aria-label="Play or pause">&#10074;&#10074;</button>
+    <button id="next" aria-label="Next move">&#9654;</button>
+    <input id="seek" type="range" min="0" value="0" step="0.01" aria-label="Timeline">
+  </div>
+</aside>
+<script>
+// iso.js: a tiny isometric (2:1 dimetric) renderer for a chess board, written from scratch.
+// Everything is plain SVG. Round pieces are "lathed" from radius profiles, the knight is an
+// extruded silhouette, crowns and crosses are boxes. No dependencies, runs in Node and browsers.
+
+const W = 96;                          // on-screen width of one tile
+const ZK = 62;                         // pixels per tile-unit of height
+const HW = W / 2, QW = W / 4;
+const EX = W * Math.SQRT1_2, EY = EX / 2;     // ellipse radii (px) for a circle of radius 1 tile
+
+const PAL = {
+  bg: '#dfe7ea', frame: '#27363f', frameSide: ['#1b2830', '#141e25'],
+  light: '#e6eadf', dark: '#5b7f7a', accent: '#d6336c', last: '#f2b01e',
+  w: { hi: '#fffaf0', mid: '#ebe1ca', lo: '#a89a7c', top: '#faf3e3' },
+  b: { hi: '#5a7188', mid: '#2e4054', lo: '#0e1721', top: '#40566b' },
+};
+
+// --- projection -------------------------------------------------------------------------
+const proj = (x, y, z = 0) => [(x - y) * HW, (x + y) * QW - z * ZK];
+const P = (x, y, z) => proj(x, y, z).map(n => n.toFixed(1)).join(',');
+const poly = (pts, fill, extra = '') => `<polygon points="${pts.map(p => P(...p)).join(' ')}" fill="${fill}" ${extra}/>`;
+
+// board square -> world centre. a1 is the dark corner nearest the viewer, White sits on the lower-right edge.
+function sqToXY(sq) {
+  const f = sq.charCodeAt(0) - 97, r = +sq[1] - 1;
+  return { x: 7 - r + 0.5, y: 7 - f + 0.5 };
+}
+
+// --- colour helpers ---------------------------------------------------------------------
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const mix = (a, b, t) => '#' + hex(a).map((v, i) => Math.round(v + (hex(b)[i] - v) * t).toString(16).padStart(2, '0')).join('');
+
+// --- primitives -------------------------------------------------------------------------
+// axis-aligned box with the three visible faces; (x,y,z) is the min corner.
+function box(x, y, z, dx, dy, dz, c) {
+  const t = z + dz;
+  return poly([[x, y, t], [x + dx, y, t], [x + dx, y + dy, t], [x, y + dy, t]], c.top)
+    + poly([[x + dx, y, t], [x + dx, y + dy, t], [x + dx, y + dy, z], [x + dx, y, z]], c.right)
+    + poly([[x, y + dy, t], [x + dx, y + dy, t], [x + dx, y + dy, z], [x, y + dy, z]], c.left);
+}
+const shades = base => ({ top: mix(base, '#ffffff', .25), left: base, right: mix(base, '#000000', .38) });
+
+// Catmull-Rom resampling of a [height, radius] profile
+function smooth(p, sub = 5) {
+  const out = [];
+  for (let i = 0; i < p.length - 1; i++) {
+    const p0 = p[Math.max(0, i - 1)], p1 = p[i], p2 = p[i + 1], p3 = p[Math.min(p.length - 1, i + 2)];
+    for (let s = 0; s < sub; s++) {
+      const t = s / sub, t2 = t * t, t3 = t2 * t;
+      out.push([0, 1].map(k => .5 * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2 + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)));
+    }
+  }
+  out.push(p[p.length - 1]);
+  return out.map(([h, r]) => [h, Math.max(0, r)]);
+}
+const egg = (c, a, rad, h0, h1, n = 8) => Array.from({ length: n + 1 }, (_, i) => {
+  const h = h0 + (h1 - h0) * i / n, d = (h - c) / a;
+  return [h, rad * Math.sqrt(Math.max(0, 1 - d * d))];
+});
+const foot = r => [[0, r], [.07, r], [.09, r - .04], [.15, r - .08]];
+
+// A lathe: a stack of frusta around a vertical axis, drawn bottom to top.
+function lathe(pts, grad, topFill) {
+  const sl = [];
+  for (let i = 0; i < pts.length - 1; i++) sl.push([pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]]);
+  let out = '';
+  sl.forEach(([hA, rA, hB, rB], i) => {
+    const yA = -hA * ZK, yB = -hB * ZK, xa = rA * EX, ya = rA * EY, xb = rB * EX, yb = rB * EY;
+    if (hB - hA > 1e-4 && (xa + xb) > .2) {
+      out += `<path d="M${-xa},${yA.toFixed(1)}L${-xb},${yB.toFixed(1)}A${xb.toFixed(1)},${yb.toFixed(1)} 0 0 1 ${xb.toFixed(1)},${yB.toFixed(1)}L${xa.toFixed(1)},${yA.toFixed(1)}A${xa.toFixed(1)},${ya.toFixed(1)} 0 0 1 ${-xa},${yA.toFixed(1)}Z" fill="url(#${grad})" stroke="url(#${grad})" stroke-width=".8" stroke-linejoin="round"/>`;
+    }
+    const nxt = sl[i + 1];
+    if (rB > .02 && (!nxt || nxt[1] < rB - .015)) out += `<ellipse cx="0" cy="${yB.toFixed(1)}" rx="${xb.toFixed(1)}" ry="${yb.toFixed(1)}" fill="${topFill}"/>`;
+  });
+  return out;
+}
+const at = (h, dx = 0, dy = 0) => [dx, -h * ZK + dy];
+// small sphere; r is in pixels, centred on (cx, cy)
+const ball = (cx, cy, r, grad, top) => { const t = r / EX; return `<g transform="translate(${cx.toFixed(1)},${(cy + r).toFixed(1)})">${lathe(egg(t, t, t, 0, 2 * t, 6), grad, top)}</g>`; };
+
+// --- pieces -----------------------------------------------------------------------------
+// Each model draws around local (0,0) = centre of the base on the board. `c` is the colour table.
+const MODELS = {
+  p(g, c) {
+    return lathe([...foot(.36), ...smooth([[.15, .28], [.28, .17], [.48, .12], [.58, .12]], 4),
+      [.58, .21], [.62, .21], [.64, .12], ...egg(.78, .16, .16, .64, .94, 8)], g, c.top);
+  },
+  r(g, c, f) {
+    let s = lathe([...foot(.37), ...smooth([[.15, .29], [.25, .24], [.7, .22]], 4), [.7, .31], [.9, .31]], g, c.top);
+    s += `<ellipse cx="0" cy="${at(.9)[1]}" rx="${.2 * EX}" ry="${.2 * EY}" fill="${c.lo}"/>`;
+    const bx = shades(c.mid);
+    for (const [dx, dy] of [[-.2, -.2], [.2, -.2], [-.2, .2], [.2, .2]]) {   // merlons, back to front
+      const [sx, sy] = proj(dx, dy, .9);
+      s += `<g transform="translate(${sx.toFixed(1)},${sy.toFixed(1)})">${box(-.07, -.07, 0, .14, .14, .16, bx)}</g>`;
+    }
+    return s;
+  },
+  n(g, c, f) {
+    const t = .3, steps = 10;
+    const prof = [[-.26, .13], [.26, .13], [.22, .3], [.28, .5], [.4, .66], [.43, .78], [.42, .86], [.3, .97], [.24, 1.2], [.12, 1.1], [-.04, 1.18], [-.17, .95], [-.25, .6], [-.27, .3]];
+    const sgn = f; // facing direction along x: White looks to -x, Black to +x
+    const pts = off => prof.map(([u, h]) => { const [sx, sy] = proj(sgn * u, off); return `${(sx).toFixed(1)},${(sy - h * ZK).toFixed(1)}`; }).join(' ');
+    let s = lathe([...foot(.37)], g, c.top);
+    for (let i = 0; i <= steps; i++) {
+      const off = -t / 2 + t * i / steps, last = i === steps;
+      s += `<polygon points="${pts(off)}" fill="${last ? `url(#${g})` : mix(c.lo, c.mid, .3)}" ${last ? `stroke="${mix(c.lo, '#000000', .2)}" stroke-width=".7"` : `stroke="${mix(c.lo, c.mid, .3)}" stroke-width="1"`} stroke-linejoin="round"/>`;
+    }
+    const [ex, ey] = proj(sgn * .2, t / 2); const hx = ex, hy = ey - .98 * ZK;
+    s += `<circle cx="${hx.toFixed(1)}" cy="${hy.toFixed(1)}" r="2.6" fill="${c.lo === PAL.w.lo ? '#2b3a46' : '#d9e3ea'}"/>`;
+    return s;
+  },
+  b(g, c) {
+    let s = lathe([...foot(.37), ...smooth([[.15, .29], [.3, .17], [.65, .12], [.74, .12]], 4),
+      [.74, .2], [.78, .2], [.8, .12], ...egg(1.05, .34, .19, .8, 1.39, 9)], g, c.top);
+    s += ball(0, -1.41 * ZK, .06 * EX * 1.1, g, c.top);
+    s += `<path d="M${-.07 * EX},${at(1.0)[1]}L${.08 * EX},${at(1.16)[1]}" stroke="${c.lo}" stroke-width="2.4" stroke-linecap="round" fill="none"/>`;
+    return s;
+  },
+  q(g, c) {
+    let s = lathe([...foot(.38), ...smooth([[.15, .3], [.3, .19], [.7, .13], [1.0, .15]], 4),
+      [1.0, .26], [1.05, .26], ...smooth([[1.05, .26], [1.2, .3], [1.42, .33]], 3), [1.46, .33]], g, c.top);
+    s += `<ellipse cx="0" cy="${at(1.46)[1]}" rx="${.21 * EX}" ry="${.21 * EY}" fill="${c.lo}"/>`;
+    const balls = [];
+    for (let k = 0; k < 7; k++) { const a = k / 7 * Math.PI * 2, [sx, sy] = proj(Math.cos(a) * .3, Math.sin(a) * .3, 1.46); balls.push([sx, sy]); }
+    balls.sort((a, b) => a[1] - b[1]).forEach(([sx, sy]) => { s += ball(sx, sy - 3, 5.2, g, c.top); });
+    s += ball(0, at(1.5)[1], 7.5, g, c.top);
+    return s;
+  },
+  k(g, c) {
+    let s = lathe([...foot(.38), ...smooth([[.15, .3], [.3, .19], [.7, .13], [1.0, .15]], 4),
+      [1.0, .26], [1.05, .26], ...smooth([[1.05, .26], [1.25, .3], [1.5, .3]], 3), [1.54, .3], ...smooth([[1.54, .3], [1.64, .22], [1.72, .09]], 3)], g, c.top);
+    const bx = shades(c.mid);
+    const [sx, sy] = proj(0, 0, 1.7);
+    s += `<g transform="translate(${sx.toFixed(1)},${sy.toFixed(1)})">${box(-.045, -.045, 0, .09, .09, .36, bx)}${box(-.13, -.045, .2, .26, .09, .08, bx)}</g>`;
+    return s;
+  },
+};
+
+function pieceSVG(p) {
+  const c = PAL[p.c], g = 'g' + p.c;
+  const [sx, sy] = proj(p.x, p.y, 0);
+  const lift = (p.z || 0) * ZK, s = p.s || 1;
+  const body = MODELS[p.t](g, c, p.c === 'w' ? -1 : 1);
+  return `<g transform="translate(${sx.toFixed(1)},${(sy - lift).toFixed(1)}) scale(${s})" opacity="${(p.a ?? 1).toFixed(2)}">${body}</g>`;
+}
+function shadowSVG(p) {
+  const [sx, sy] = proj(p.x, p.y, 0), k = 1 - Math.min(.5, (p.z || 0) * .6);
+  return `<ellipse cx="${(sx + 7).toFixed(1)}" cy="${(sy + 4).toFixed(1)}" rx="${(.4 * EX * k).toFixed(1)}" ry="${(.4 * EY * k).toFixed(1)}" fill="#0b1a20" opacity="${(.24 * k * (p.a ?? 1)).toFixed(2)}"/>`;
+}
+
+// --- board ------------------------------------------------------------------------------
+function boardSVG() {
+  const m = -.3, e = 8.3, T = .45;
+  let s = poly([[m, e, 0], [e, e, 0], [e, e, -T], [m, e, -T]], PAL.frameSide[0]);
+  s += poly([[e, m, 0], [e, e, 0], [e, e, -T], [e, m, -T]], PAL.frameSide[1]);
+  s += poly([[m, m, 0], [e, m, 0], [e, e, 0], [m, e, 0]], PAL.frame);
+  for (let f = 0; f < 8; f++) for (let r = 0; r < 8; r++) {
+    const x0 = 7 - r, y0 = 7 - f;
+    s += poly([[x0, y0, 0], [x0 + 1, y0, 0], [x0 + 1, y0 + 1, 0], [x0, y0 + 1, 0]], (f + r) % 2 ? PAL.light : PAL.dark);
+  }
+  const lab = (t, x, y) => { const [sx, sy] = proj(x, y, 0); return `<text x="${sx.toFixed(1)}" y="${(sy + 4).toFixed(1)}" text-anchor="middle" font-size="12" fill="#9fb4ba" font-family="Helvetica,Arial,sans-serif">${t}</text>`; };
+  for (let i = 0; i < 8; i++) { s += lab('abcdefgh'[i], 8.62, 7 - i + .5); s += lab(i + 1, 7 - i + .5, 8.62); }
+  return s;
+}
+const squareQuad = (sq, fill, op) => { const { x, y } = sqToXY(sq); return poly([[x - .5, y - .5, .01], [x + .5, y - .5, .01], [x + .5, y + .5, .01], [x - .5, y + .5, .01]], fill, `opacity="${op}"`); };
+function arrowSVG(a, b, alpha) {
+  const A = sqToXY(a), B = sqToXY(b), dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy), ux = dx / L, uy = dy / L, px = -uy, py = ux;
+  const s0 = .22, s1 = L - .5, hl = .4, w = .09, hw = .23;
+  const pt = (a1, b1) => [A.x + ux * a1 + px * b1, A.y + uy * a1 + py * b1, .02];
+  const pts = [pt(s0, w), pt(s1 - hl + .1, w), pt(s1 - hl, hw), pt(s1 + .12, 0), pt(s1 - hl, -hw), pt(s1 - hl + .1, -w), pt(s0, -w)];
+  return poly(pts, PAL.accent, `opacity="${(.88 * alpha).toFixed(2)}" stroke="#fff" stroke-opacity="${(.5 * alpha).toFixed(2)}" stroke-width="1"`);
+}
+
+const DEFS = ['w', 'b'].map(k => { const c = PAL[k]; return `<linearGradient id="g${k}" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="${mix(c.hi, c.mid, .5)}"/><stop offset=".28" stop-color="${c.hi}"/><stop offset=".6" stop-color="${c.mid}"/><stop offset="1" stop-color="${c.lo}"/></linearGradient>`; }).join('');
+
+// scene = { pieces:[{t,c,x,y,z,s,a}], hl:[{sq,kind,a}], arrows:[[from,to]], arrowAlpha }
+// opts  = { bg:boolean }  adds a background so the SVG works standalone
+function renderScene(scene, opts = {}) {
+  const vb = '-410 -125 820 565';
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${vb}" width="100%" height="100%" role="img" aria-label="Isometric chess position"><defs>${DEFS}</defs>`;
+  if (opts.bg) s += `<rect x="-410" y="-125" width="820" height="565" fill="${PAL.bg}"/>`;
+  s += boardSVG();
+  for (const h of scene.hl || []) s += squareQuad(h.sq, h.kind === 'check' ? PAL.accent : PAL.last, h.a ?? .4);
+  for (const m of scene.marks || []) s += squareQuad(m, PAL.accent, .45 * (scene.arrowAlpha ?? 1));
+  const ps = [...scene.pieces].sort((a, b) => (a.x + a.y) - (b.x + b.y) || (a.z || 0) - (b.z || 0));
+  for (const p of ps) s += shadowSVG(p);
+  for (const [a, b] of scene.arrows || []) s += arrowSVG(a, b, scene.arrowAlpha ?? 1);
+  for (const p of ps) s += pieceSVG(p);
+  return s + '</svg>';
+}
+
+// timeline.js: turns replay frames into poses at any time t. Pure functions, shared by the
+// interactive viewer (requestAnimationFrame) and the video renderer (one frame per call).
+
+const TIMING = { intro: 3.6, move: 0.9, hold: 0.45, note: 3.2, outro: 5 };
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+function buildTimeline(frames, notes) {
+  const segs = []; let t = TIMING.intro;
+  for (let i = 1; i < frames.length; i++) {
+    const t0 = t, t1 = t0 + TIMING.move, t2 = t1 + (notes[i] ? TIMING.note : TIMING.hold);
+    segs.push({ ply: i, t0, t1, t2 }); t = t2;
+  }
+  return { segs, total: t + TIMING.outro, introEnd: TIMING.intro, end: t };
+}
+
+function poseAt(tl, frames, notes, t, sqToXY) {
+  const seg = tl.segs.find(s => t >= s.t0 && t < s.t2);
+  const last = frames.length - 1;
+  const ply = seg ? seg.ply : (t < tl.introEnd ? 0 : last);
+  const phase = !seg ? (ply === 0 ? 'intro' : 'outro') : t < seg.t1 ? 'move' : 'hold';
+  const B = frames[ply], A = frames[Math.max(0, ply - 1)];
+  const note = notes[ply];
+  const place = sq => sqToXY(sq);
+  let pieces;
+  if (phase === 'move') {
+    const p = clamp((t - seg.t0) / (seg.t1 - seg.t0)), e = ease(p), m = B.move;
+    const bById = new Map(B.pieces.map(q => [q.id, q]));
+    pieces = A.pieces.map(a => {
+      const b = bById.get(a.id), o = { t: a.t, c: a.c, id: a.id, ...place(a.sq), z: 0, a: 1 };
+      if (!b) { const f = clamp((p - .55) / .3); o.a = 1 - f; o.z = f * .35; o.s = 1 + f * .15; return o; }
+      if (a.sq !== b.sq) {
+        const from = place(a.sq), to = place(b.sq);
+        o.x = from.x + (to.x - from.x) * e; o.y = from.y + (to.y - from.y) * e;
+        if (m.rook && a.id === m.rook.id) o.z = .3 * Math.sin(Math.PI * e);
+        else o.z = (a.t === 'n' ? .9 : .5) * Math.sin(Math.PI * e);
+      }
+      if (b.t !== a.t && p > .5) o.t = b.t;
+      return o;
+    });
+  } else {
+    pieces = B.pieces.map(b => ({ t: b.t, c: b.c, id: b.id, ...place(b.sq), z: 0, a: 1 }));
+    if (phase === 'intro') for (const o of pieces) {            // pieces drop onto the board, back rank first
+      const k = clamp((t - 0.25 - (o.x + o.y) / 14 * 1.5) / .7);
+      o.a = clamp(k * 3); o.z = 3 * Math.pow(1 - ease(k), 2);
+    }
+  }
+  const hl = [];
+  if (B.move && phase !== 'move') {
+    hl.push({ sq: B.move.from, a: .3 }, { sq: B.move.to, a: .45 });
+    if (B.move.kingSq) hl.push({ sq: B.move.kingSq, kind: 'check', a: .6 });
+  }
+  const arrowAlpha = phase === 'hold' && note ? clamp((t - seg.t1) / .45) : 0;
+  const scene = { pieces, hl, arrows: arrowAlpha > 0 && note?.arrows || [], marks: arrowAlpha > 0 && note?.marks || [], arrowAlpha };
+  const key = [ply, phase, phase === 'move' ? Math.round((t - seg.t0) * 1000) : phase === 'intro' ? Math.round(t * 1000) : 0, arrowAlpha.toFixed(2)].join('|');
+  return { scene, ply, phase, key, seg };
+}
+
+const DATA = {"title":"The Opera Game","subtitle":"Paris, 1858. Paul Morphy plays White in a box at the opera against two noblemen who are consulting over every move.","frames":[{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"c8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d7"},{"id":12,"t":"p","c":"b","sq":"e7"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d2"},{"id":20,"t":"p","c":"w","sq":"e2"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"g1"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":null},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"c8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d7"},{"id":12,"t":"p","c":"b","sq":"e7"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"g1"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"e4","from":"e2","to":"e4","color":"w","piece":"p","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"c8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d7"},{"id":12,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"g1"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"e5","from":"e7","to":"e5","color":"b","piece":"p","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"c8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d7"},{"id":12,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"f3"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Nf3","from":"g1","to":"f3","color":"w","piece":"n","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"c8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d6"},{"id":12,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"f3"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"d6","from":"d7","to":"d6","color":"b","piece":"p","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"c8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d6"},{"id":12,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d4"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"f3"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"d4","from":"d2","to":"d4","color":"w","piece":"p","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"g4"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d6"},{"id":12,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"d4"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"f3"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Bg4","from":"c8","to":"g4","color":"b","piece":"b","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"g4"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d6"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"e5"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":30,"t":"n","c":"w","sq":"f3"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"dxe5","from":"d4","to":"e5","color":"w","piece":"p","captured":12,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":2,"t":"b","c":"b","sq":"f3"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d6"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"e5"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"d1"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Bxf3","from":"g4","to":"f3","color":"b","piece":"b","captured":30,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"d6"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":19,"t":"p","c":"w","sq":"e5"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"f3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Qxf3","from":"d1","to":"f3","color":"w","piece":"q","captured":2,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"f3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"f1"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"dxe5","from":"d6","to":"e5","color":"b","piece":"p","captured":19,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"g8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"f3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Bc4","from":"f1","to":"c4","color":"w","piece":"b","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"f3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Nf6","from":"g8","to":"f6","color":"b","piece":"n","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"d8"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Qb3","from":"f3","to":"b3","color":"w","piece":"q","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b1"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Qe7","from":"d8","to":"e7","color":"b","piece":"q","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"c3"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Nc3","from":"b1","to":"c3","color":"w","piece":"n","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c6"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"c3"},{"id":26,"t":"b","c":"w","sq":"c1"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"c6","from":"c7","to":"c6","color":"b","piece":"p","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b7"},{"id":10,"t":"p","c":"b","sq":"c6"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"c3"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Bg5","from":"c1","to":"g5","color":"w","piece":"b","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":9,"t":"p","c":"b","sq":"b5"},{"id":10,"t":"p","c":"b","sq":"c6"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"c3"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"b5","from":"b7","to":"b5","color":"b","piece":"p","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":10,"t":"p","c":"b","sq":"c6"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":25,"t":"n","c":"w","sq":"b5"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Nxb5","from":"c3","to":"b5","color":"w","piece":"n","captured":9,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":10,"t":"p","c":"b","sq":"b5"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"c4"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"cxb5","from":"c6","to":"b5","color":"b","piece":"p","captured":25,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"b8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Bxb5+","from":"c4","to":"b5","color":"w","piece":"b","captured":10,"rook":null,"check":true,"mate":false,"kingSq":"e8"}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"d7"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"a1"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"e1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Nbd7","from":"b8","to":"d7","color":"b","piece":"n","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"a8"},{"id":1,"t":"n","c":"b","sq":"d7"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"d1"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"O-O-O","from":"e1","to":"c1","color":"w","piece":"k","captured":null,"rook":{"id":24,"from":"a1","to":"d1"},"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"d8"},{"id":1,"t":"n","c":"b","sq":"d7"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"d1"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Rd8","from":"a8","to":"d8","color":"b","piece":"r","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"d8"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":24,"t":"r","c":"w","sq":"d7"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Rxd7","from":"d1","to":"d7","color":"w","piece":"r","captured":1,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"d7"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"h1"}],"move":{"san":"Rxd7","from":"d8","to":"d7","color":"b","piece":"r","captured":24,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"d7"},{"id":3,"t":"q","c":"b","sq":"e7"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"d1"}],"move":{"san":"Rd1","from":"h1","to":"d1","color":"w","piece":"r","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":0,"t":"r","c":"b","sq":"d7"},{"id":3,"t":"q","c":"b","sq":"e6"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"b5"},{"id":31,"t":"r","c":"w","sq":"d1"}],"move":{"san":"Qe6","from":"e7","to":"e6","color":"b","piece":"q","captured":null,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":3,"t":"q","c":"b","sq":"e6"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"f6"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":29,"t":"b","c":"w","sq":"d7"},{"id":31,"t":"r","c":"w","sq":"d1"}],"move":{"san":"Bxd7+","from":"b5","to":"d7","color":"w","piece":"b","captured":0,"rook":null,"check":true,"mate":false,"kingSq":"e8"}},{"pieces":[{"id":3,"t":"q","c":"b","sq":"e6"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"d7"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b3"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":31,"t":"r","c":"w","sq":"d1"}],"move":{"san":"Nxd7","from":"f6","to":"d7","color":"b","piece":"n","captured":29,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":3,"t":"q","c":"b","sq":"e6"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"d7"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":27,"t":"q","c":"w","sq":"b8"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":31,"t":"r","c":"w","sq":"d1"}],"move":{"san":"Qb8+","from":"b3","to":"b8","color":"w","piece":"q","captured":null,"rook":null,"check":true,"mate":false,"kingSq":"e8"}},{"pieces":[{"id":3,"t":"q","c":"b","sq":"e6"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"b8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":31,"t":"r","c":"w","sq":"d1"}],"move":{"san":"Nxb8","from":"d7","to":"b8","color":"b","piece":"n","captured":27,"rook":null,"check":false,"mate":false,"kingSq":null}},{"pieces":[{"id":3,"t":"q","c":"b","sq":"e6"},{"id":4,"t":"k","c":"b","sq":"e8"},{"id":5,"t":"b","c":"b","sq":"f8"},{"id":6,"t":"n","c":"b","sq":"b8"},{"id":7,"t":"r","c":"b","sq":"h8"},{"id":8,"t":"p","c":"b","sq":"a7"},{"id":11,"t":"p","c":"b","sq":"e5"},{"id":13,"t":"p","c":"b","sq":"f7"},{"id":14,"t":"p","c":"b","sq":"g7"},{"id":15,"t":"p","c":"b","sq":"h7"},{"id":16,"t":"p","c":"w","sq":"a2"},{"id":17,"t":"p","c":"w","sq":"b2"},{"id":18,"t":"p","c":"w","sq":"c2"},{"id":20,"t":"p","c":"w","sq":"e4"},{"id":21,"t":"p","c":"w","sq":"f2"},{"id":22,"t":"p","c":"w","sq":"g2"},{"id":23,"t":"p","c":"w","sq":"h2"},{"id":26,"t":"b","c":"w","sq":"g5"},{"id":28,"t":"k","c":"w","sq":"c1"},{"id":31,"t":"r","c":"w","sq":"d8"}],"move":{"san":"Rd8#","from":"d1","to":"d8","color":"w","piece":"r","captured":null,"rook":null,"check":true,"mate":true,"kingSq":"e8"}}],"notes":{"1":{"text":"Morphy grabs the center and opens lines for his bishop and queen. Everything that follows is about getting pieces into the game faster than the opponent."},"6":{"text":"Black pins the knight on f3 to the queen standing behind it. A pinned piece cannot move without losing something bigger.","arrows":[["g4","d1"]]},"9":{"text":"The trade is done and the queen is back in play. Material is even, White’s queen is active, and most of Black’s pieces are still at home."},"11":{"text":"The bishop looks straight at f7, the one square next to the king that only the king itself defends.","arrows":[["c4","f7"]]},"13":{"text":"The queen now attacks f7 and b7 at the same time. Two threats at once is what tactics are made of.","arrows":[["b3","f7"],["b3","b7"]]},"14":{"text":"Black covers f7 with the queen. Morphy keeps developing instead of grabbing material."},"17":{"text":"Bg5 pins the knight on f6 to the queen on e7. Black can barely move.","arrows":[["g5","e7"]]},"18":{"text":"Black tries to chase the bishop away with ...b5. It opens up lines in front of his own king, which is the real danger."},"19":{"text":"Morphy gives up a knight on purpose. If the c6 pawn takes the knight, the bishop captures it with check.","marks":["b5"]},"21":{"text":"The bishop checks along the diagonal. Black blocks with the knight, which is now pinned and cannot move.","arrows":[["b5","e8"]]},"23":{"text":"Castling long brings the rook to the d-file with a direct threat on the pinned knight.","arrows":[["d1","d7"]]},"27":{"text":"The second rook joins the d-file. The rook on d7 is pinned by the bishop and attacked twice.","arrows":[["d1","d7"],["b5","d7"]]},"29":{"text":"The bishop takes the rook with check and Black recaptures with the knight. The b-file is wide open now, and the queen on b3 has a clear path to b8."},"31":{"text":"Qb8+ gives up the queen. Black has only one legal reply, taking it with the knight.","arrows":[["b3","b8"]]},"33":{"text":"Rd8 is checkmate. The bishop on g5 guards the rook, and every escape square is covered. Black’s rook never left h8.","arrows":[["d1","d8"],["g5","d8"]]}},"outro":"Every frame here is generated by code: a hand-written isometric SVG renderer with lathed pieces and no 3D engine."};
+const { frames, notes } = DATA;
+const tl = buildTimeline(frames, notes);
+const $ = id => document.getElementById(id);
+const VIDEO = new URLSearchParams(location.search).has('video');
+if (VIDEO) document.body.classList.add('video');
+$('title').textContent = DATA.title;
+
+// move list
+const sans = frames.slice(1).map(f => f.move.san);
+let html = '';
+sans.forEach((s, i) => { if (i % 2 === 0) html += `<span class="n">${i / 2 + 1}.</span>`; html += `<span data-ply="${i + 1}" id="m${i + 1}">${s}</span>`; });
+$('moves').innerHTML = html;
+$('moves').addEventListener('click', e => { const p = +e.target.dataset.ply; if (p) seekPly(p); });
+
+let t = 0, playing = !matchMedia('(prefers-reduced-motion: reduce)').matches, lastTs = 0, lastUi = '';
+$('seek').max = tl.total;
+
+function ui(pose) {
+  const k = pose.ply + '|' + pose.phase;
+  if (k === lastUi) return; lastUi = k;
+  const m = frames[pose.ply].move, n = notes[pose.ply];
+  $('sub').textContent = pose.phase === 'intro' ? DATA.subtitle : 'Paul Morphy (White) with the Duke of Brunswick and Count Isouard (Black), 1858.';
+  $('san').innerHTML = m ? `${Math.ceil(pose.ply / 2)}${pose.ply % 2 ? '.' : '...'} ${m.san}<small>${m.color === 'w' ? 'White' : 'Black'} plays</small>` : `<small>Starting position</small>`;
+  $('note').textContent = pose.phase === 'outro' ? DATA.outro : pose.phase === 'intro' ? 'Black spends his first moves on pawns and a trade. Morphy develops with threats, and thirty-three half-moves later it ends in a forced checkmate.' : (n ? n.text : '');
+  document.querySelectorAll('.moves span[data-ply]').forEach(el => { const p = +el.dataset.ply; el.classList.toggle('on', p === pose.ply); el.classList.toggle('seen', p < pose.ply); });
+  const cur = $('m' + pose.ply); if (cur && !VIDEO) cur.scrollIntoView({ block: 'nearest' });
+}
+function render() {
+  const pose = poseAt(tl, frames, notes, t, sqToXY);
+  $('stage').innerHTML = renderScene(pose.scene);
+  ui(pose); $('seek').value = t;
+  return pose.key + '|' + (t > tl.end ? 'o' : '');
+}
+function seekPly(p) { t = tl.segs[p - 1].t1 + .05; playing = false; sync(); render(); }
+function sync() { $('play').innerHTML = playing ? '&#10074;&#10074;' : '&#9654;'; }
+function tick(ts) {
+  if (playing) { t += (ts - lastTs) / 1000; if (t >= tl.total) { t = tl.total - .001; playing = false; sync(); } render(); }
+  lastTs = ts; requestAnimationFrame(tick);
+}
+$('play').onclick = () => { if (!playing && t >= tl.total - .01) t = 0; playing = !playing; sync(); };
+$('seek').oninput = e => { t = +e.target.value; playing = false; sync(); render(); };
+const cur = () => { const s = tl.segs.find(s => t >= s.t0 && t < s.t2); return s ? s.ply : (t < tl.introEnd ? 0 : frames.length - 1); };
+$('prev').onclick = () => seekPly(Math.max(1, cur() - 1));
+$('next').onclick = () => seekPly(Math.min(frames.length - 1, cur() + 1));
+addEventListener('keydown', e => { if (e.key === ' ') { e.preventDefault(); $('play').click(); } if (e.key === 'ArrowRight') $('next').click(); if (e.key === 'ArrowLeft') $('prev').click(); });
+
+window.renderAt = s => { t = s; return render(); };      // used by scripts/render_video.py
+window.TOTAL = tl.total;
+window.keyAt = s => poseAt(tl, frames, notes, s, sqToXY).key;     // cheap: lets the video script skip duplicate frames
+window.holdOf = ply => tl.segs[ply - 1].t2 - .01;
+sync(); render(); if (!VIDEO) requestAnimationFrame(ts => { lastTs = ts; tick(ts); });
+</script>
+</body>
+</html>

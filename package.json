@@ -1,0 +1,12 @@
+{
+  "name": "isometric-chess",
+  "version": "1.0.0",
+  "description": "A hand-built isometric SVG renderer that turns a chess game into an interactive viewer and an explainer video. No 3D engine, no canvas, just math and <path>.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "video": "python3 scripts/render_video.py"
+  },
+  "license": "MIT",
+  "dependencies": { "chess.js": "^1.0.0" }
+}

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Opera Game, in isometric</title>
+<style>
+:root{--fog:#dfe7ea;--ink:#1b2830;--ink2:#26363f;--paper:#eef3f2;--mute:#9db1b8;--amber:#f2b01e;--rasp:#d6336c;
+  --serif:Charter,'Bitstream Charter','Iowan Old Style','Palatino Linotype',Georgia,serif;
+  --sans:'Segoe UI','Helvetica Neue',Arial,'FreeSans',sans-serif}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--fog);color:var(--paper);font-family:var(--sans);display:grid;grid-template-columns:1fr 400px}
+.stage{display:flex;align-items:center;justify-content:center;padding:12px;min-width:0;min-height:0}
+.stage svg{max-height:100vh;display:block}
+aside{background:var(--ink);padding:30px 28px 22px;display:flex;flex-direction:column;gap:16px;min-height:0;overflow:hidden}
+h1{font:600 34px/1.05 var(--serif);margin:0;letter-spacing:-.01em}
+.sub{margin:0;color:var(--mute);font-size:13.5px;line-height:1.5}
+.now{border-top:1px solid #3a4d58;padding-top:16px}
+.san{font:600 30px/1 var(--serif);display:flex;align-items:baseline;gap:10px}
+.san small{font:500 12.5px var(--sans);color:var(--mute)}
+.note{margin:12px 0 0;font:17px/1.5 var(--serif);min-height:7.5em}
+.moves{display:grid;grid-template-columns:26px 1fr 1fr 26px 1fr 1fr;gap:2px 6px;font-size:13.5px;overflow:auto;align-content:start;flex:1;min-height:0;padding-right:4px}
+.moves span{padding:2px 5px;border-radius:4px;cursor:pointer;color:#c5d3d8}
+.moves .n{color:var(--mute);cursor:default;padding-left:0}
+.moves .on{background:var(--amber);color:#1b1b1b;font-weight:600}
+.moves .seen{color:#fff}
+.ctl{display:flex;align-items:center;gap:10px}
+.ctl button{background:var(--ink2);color:var(--paper);border:1px solid #3a4d58;border-radius:8px;height:36px;min-width:40px;font-size:15px;cursor:pointer}
+.ctl button:hover{border-color:var(--amber)}
+.ctl input{flex:1;accent-color:var(--amber)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.video .ctl{display:none}
+.video aside{padding-bottom:30px}
+@media (max-width:900px){body{grid-template-columns:1fr;grid-template-rows:auto 1fr;height:auto}aside{min-height:60vh}.stage svg{max-height:55vh}}
+</style>
+</head>
+<body>
+<div class="stage" id="stage"></div>
+<aside>
+  <div><h1 id="title"></h1><p class="sub" id="sub"></p></div>
+  <div class="now"><div class="san" id="san"></div><p class="note" id="note"></p></div>
+  <div class="moves" id="moves" aria-label="Move list"></div>
+  <div class="ctl">
+    <button id="prev" aria-label="Previous move">&#9664;</button>
+    <button id="play" aria-label="Play or pause">&#10074;&#10074;</button>
+    <button id="next" aria-label="Next move">&#9654;</button>
+    <input id="seek" type="range" min="0" value="0" step="0.01" aria-label="Timeline">
+  </div>
+</aside>
+<script>
+/*__ENGINE__*/
+const DATA = /*__DATA__*/;
+const { frames, notes } = DATA;
+const tl = buildTimeline(frames, notes);
+const $ = id => document.getElementById(id);
+const VIDEO = new URLSearchParams(location.search).has('video');
+if (VIDEO) document.body.classList.add('video');
+$('title').textContent = DATA.title;
+
+// move list
+const sans = frames.slice(1).map(f => f.move.san);
+let html = '';
+sans.forEach((s, i) => { if (i % 2 === 0) html += `<span class="n">${i / 2 + 1}.</span>`; html += `<span data-ply="${i + 1}" id="m${i + 1}">${s}</span>`; });
+$('moves').innerHTML = html;
+$('moves').addEventListener('click', e => { const p = +e.target.dataset.ply; if (p) seekPly(p); });
+
+let t = 0, playing = !matchMedia('(prefers-reduced-motion: reduce)').matches, lastTs = 0, lastUi = '';
+$('seek').max = tl.total;
+
+function ui(pose) {
+  const k = pose.ply + '|' + pose.phase;
+  if (k === lastUi) return; lastUi = k;
+  const m = frames[pose.ply].move, n = notes[pose.ply];
+  $('sub').textContent = pose.phase === 'intro' ? DATA.subtitle : 'Paul Morphy (White) with the Duke of Brunswick and Count Isouard (Black), 1858.';
+  $('san').innerHTML = m ? `${Math.ceil(pose.ply / 2)}${pose.ply % 2 ? '.' : '...'} ${m.san}<small>${m.color === 'w' ? 'White' : 'Black'} plays</small>` : `<small>Starting position</small>`;
+  $('note').textContent = pose.phase === 'outro' ? DATA.outro : pose.phase === 'intro' ? 'Black spends his first moves on pawns and a trade. Morphy develops with threats, and thirty-three half-moves later it ends in a forced checkmate.' : (n ? n.text : '');
+  document.querySelectorAll('.moves span[data-ply]').forEach(el => { const p = +el.dataset.ply; el.classList.toggle('on', p === pose.ply); el.classList.toggle('seen', p < pose.ply); });
+  const cur = $('m' + pose.ply); if (cur && !VIDEO) cur.scrollIntoView({ block: 'nearest' });
+}
+function render() {
+  const pose = poseAt(tl, frames, notes, t, sqToXY);
+  $('stage').innerHTML = renderScene(pose.scene);
+  ui(pose); $('seek').value = t;
+  return pose.key + '|' + (t > tl.end ? 'o' : '');
+}
+function seekPly(p) { t = tl.segs[p - 1].t1 + .05; playing = false; sync(); render(); }
+function sync() { $('play').innerHTML = playing ? '&#10074;&#10074;' : '&#9654;'; }
+function tick(ts) {
+  if (playing) { t += (ts - lastTs) / 1000; if (t >= tl.total) { t = tl.total - .001; playing = false; sync(); } render(); }
+  lastTs = ts; requestAnimationFrame(tick);
+}
+$('play').onclick = () => { if (!playing && t >= tl.total - .01) t = 0; playing = !playing; sync(); };
+$('seek').oninput = e => { t = +e.target.value; playing = false; sync(); render(); };
+const cur = () => { const s = tl.segs.find(s => t >= s.t0 && t < s.t2); return s ? s.ply : (t < tl.introEnd ? 0 : frames.length - 1); };
+$('prev').onclick = () => seekPly(Math.max(1, cur() - 1));
+$('next').onclick = () => seekPly(Math.min(frames.length - 1, cur() + 1));
+addEventListener('keydown', e => { if (e.key === ' ') { e.preventDefault(); $('play').click(); } if (e.key === 'ArrowRight') $('next').click(); if (e.key === 'ArrowLeft') $('prev').click(); });
+
+window.renderAt = s => { t = s; return render(); };      // used by scripts/render_video.py
+window.TOTAL = tl.total;
+window.keyAt = s => poseAt(tl, frames, notes, s, sqToXY).key;     // cheap: lets the video script skip duplicate frames
+window.holdOf = ply => tl.segs[ply - 1].t2 - .01;
+sync(); render(); if (!VIDEO) requestAnimationFrame(ts => { lastTs = ts; tick(ts); });
+</script>
+</body>
+</html>
